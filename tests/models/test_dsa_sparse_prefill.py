@@ -84,6 +84,7 @@ class _SparsePrefillTests:
             self.module.ModelArgs.from_dict(self.config)
         ).model.layers
         self.assertTrue(all(layer.self_attn.sparse_prefill for layer in layers))
+        self.assertTrue(all(layer.self_attn.sparse_prefill_fused for layer in layers))
 
     def test_sparse_prefill_matches_dense(self):
         mx.random.seed(0)

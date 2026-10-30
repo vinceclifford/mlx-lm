@@ -13,6 +13,8 @@ from mlx_lm.kernels import (
     qk_norm,
     qk_norm_rope,
     rms_norm_sigmoid_gate,
+    sparse_mla,
+    sparse_mla_attention,
 )
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
@@ -74,6 +76,18 @@ def _rope(x, offset):
         x, x.shape[-1], traditional=True, base=10000.0, scale=1.0, offset=offset
     )
     return x.swapaxes(1, 2)
+
+
+def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
+    # Attention of each query over its selected rows; -1 entries are skipped.
+    rows = mx.maximum(idx, 0)
+    keys = mx.concatenate([kv, k_pe], axis=-1)[rows].astype(mx.float32)  # [L, K, r + p]
+    queries = mx.concatenate([q, q_pe], axis=-1).astype(mx.float32)  # [H, L, r + p]
+    scores = (queries[:, :, None, :] * keys[None]).sum(-1) * scale  # [H, L, K]
+    scores = mx.where((idx >= 0)[None], scores, -mx.inf)
+    probs = mx.softmax(scores, axis=-1)
+    values = kv[rows].astype(mx.float32)  # [L, K, r]
+    return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
 
 
 @unittest.skipIf(not mx.metal.is_available(), "The kernels need the Metal backend")
@@ -178,6 +192,35 @@ class TestKernels(unittest.TestCase):
             ref = ref.transpose(0, 2, 1, 3).reshape(B, L, H * D)
             ref = ref * mx.sigmoid(gate.astype(mx.float32))
             self._assert_close(out, ref.astype(dtype), TOL[dtype])
+
+    def test_sparse_mla_attention(self):
+        # DSA sizes (512 latent + 64 rope), 16 heads, a top-k that isn't a multiple of
+        # the kernel's key block, and skipped (-1) entries.
+        H, L, N, K, r, p = 16, 7, 300, 100, 512, 64
+        mx.random.seed(0)
+        idx = mx.random.randint(0, N, (L, K)).astype(mx.int32)
+        idx = mx.where(mx.random.uniform(shape=(L, K)) < 0.1, -1, idx)
+        for dtype in (mx.bfloat16, mx.float16):
+            q = mx.random.normal((H, L, r)).astype(dtype)
+            q_pe = mx.random.normal((H, L, p)).astype(dtype)
+            kv = mx.random.normal((N, r)).astype(dtype)
+            k_pe = mx.random.normal((N, p)).astype(dtype)
+            ref = _sparse_mla_ref(q, q_pe, kv, k_pe, idx, 0.05).astype(dtype)
+            for variant in sparse_mla.VARIANTS:
+                if not sparse_mla.is_available(variant):
+                    continue
+                out = sparse_mla_attention(
+                    q, q_pe, kv, k_pe, idx, 0.05, variant=variant
+                )
+                self._assert_close(out, ref, 2e-2)
+
+    def test_sparse_mla_unsupported_shapes(self):
+        q = mx.zeros((16, 2, 32))
+        q_pe = mx.zeros((16, 2, 8))
+        kv, k_pe = mx.zeros((40, 32)), mx.zeros((40, 8))
+        idx = mx.zeros((2, 4), mx.int32)
+        # A latent width the kernel can't split across its simdgroups.
+        self.assertIsNone(sparse_mla_attention(q, q_pe, kv, k_pe, idx, 1.0))
 
 
 if __name__ == "__main__":
